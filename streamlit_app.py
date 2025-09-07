@@ -1,7 +1,8 @@
 # streamlit_app.py
-import os, math, json, requests
+import os, math, json, time
 import pandas as pd
 import numpy as np
+import requests
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -18,12 +19,12 @@ h1 {background: linear-gradient(90deg, #7C4DFF, #4DD0E1);
 ''', unsafe_allow_html=True)
 
 st.title("🚀 Memecoin Dashboard — Beginner Edition")
-st.caption("Discover • Score • Track — with safe defaults and visuals")
+st.caption("Discover • Score • Track — Demo & Live modes with visuals")
 
-load_dotenv()
+load_dotenv()  # loads .env locally; in Streamlit Cloud use Secrets
 
 # -------------------- Controls --------------------
-mode = st.radio("Data source mode", ["Demo (offline)"], horizontal=True)
+mode = st.radio("Data source mode", ["Demo (offline)", "Live (internet)"], horizontal=True)
 chains = st.multiselect("Chains", ["Ethereum", "Solana", "BSC"],
                         default=["Ethereum", "Solana", "BSC"])
 
@@ -60,19 +61,136 @@ wtot = sum(weights.values()) or 1
 for k in weights:
     weights[k] = weights[k] / wtot
 
-# -------------------- Load demo data --------------------
+# -------------------- Helpers --------------------
+def minmax(s, invert=False):
+    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    if s.max() == s.min():
+        norm = pd.Series(0.5, index=s.index)
+    else:
+        norm = (s - s.min()) / (s.max() - s.min())
+    return 1 - norm if invert else norm
+
+def std_cols():
+    """Return empty DataFrame with the standard schema we use."""
+    return pd.DataFrame(columns=[
+        "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
+        "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
+        "top10_holders_pct","telegram_members","twitter_followers","sentiment_score"
+    ])
+
+def normalize_chain(cid: str) -> str:
+    cid = (cid or "").lower()
+    if cid in ("eth","ethereum"): return "Ethereum"
+    if cid in ("sol","solana"):   return "Solana"
+    if cid in ("bsc","bnb"):      return "BSC"
+    return cid.capitalize() if cid else "Unknown"
+
+def safe_get(url, headers=None, params=None, timeout=15):
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
+
+# -------------------- Data loaders --------------------
 @st.cache_data
 def load_demo():
-    # Expects sample_data.csv in repo root
     return pd.read_csv("sample_data.csv")
 
-try:
-    data = load_demo()
-except FileNotFoundError:
-    st.error("sample_data.csv not found. Add it to the same folder as streamlit_app.py.")
-    st.stop()
+@st.cache_data(ttl=180)
+def load_live(chains_selected):
+    """
+    Live mode:
+      - DexScreener trending pairs (no key) → base liquidity/volume/txns/mcap/price
+      - If BIRDEYE_API_KEY set, enrich SOL tokens with created time (age)
+    Returns DataFrame with our standard columns.
+    """
+    rows = []
+    # DexScreener trending
+    ds = safe_get("https://api.dexscreener.com/latest/dex/trending") or {}
+    pairs = ds.get("pairs", []) if isinstance(ds, dict) else []
 
-# Ensure required columns exist (in case you swap datasets later)
+    for p in pairs[:200]:
+        chain = normalize_chain(p.get("chainId", ""))
+        if chain not in chains_selected:  # respect filter early
+            continue
+
+        liq_usd = (p.get("liquidity") or {}).get("usd") or 0
+        vol24  = (p.get("volume") or {}).get("h24") or 0
+        tx24   = (p.get("txns") or {}).get("h24") or 0
+        fdv    = p.get("fdv") or 0
+        price  = p.get("priceUsd") or 0
+
+        base = p.get("baseToken") or {}
+        name = base.get("name") or base.get("symbol") or "Unknown"
+        sym  = base.get("symbol") or "?"
+
+        # placeholders; can be enriched later
+        rows.append(dict(
+            name=name, symbol=sym, chain=chain,
+            price=float(price or 0),
+            liquidity_usd=float(liq_usd or 0),
+            volume24h_usd=float(vol24 or 0),
+            txns24h=int(tx24 or 0),
+            mcap_usd=float(fdv or 0),
+            age_days=np.nan,                # will fill for Solana via Birdeye if possible
+            is_honeypot=False,              # needs security API (GoPlus) if you add it
+            owner_renounced=False,
+            liquidity_locked_pct=np.nan,    # needs locker/explorer API
+            top10_holders_pct=np.nan,       # needs explorer API
+            telegram_members=np.nan,
+            twitter_followers=np.nan,
+            sentiment_score=np.nan
+        ))
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return std_cols()
+
+    # Optional Birdeye enrichment (Solana age)
+    birdeye_key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
+    if birdeye_key and ("Solana" in df["chain"].unique()):
+        # Endpoint: tokens created recently (we'll just pull some and map by symbol/name best-effort)
+        # You can replace with a more precise endpoint if you have contract addresses.
+        headers = {"X-API-KEY": birdeye_key}
+        # Try recent tokens list
+        bj = safe_get(
+            "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
+            headers=headers
+        ) or {}
+        tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
+        bd = pd.DataFrame(tokens)
+        # Map heuristically by symbol/name (imperfect but useful for rough age)
+        if not bd.empty and "symbol" in bd.columns and "createdTime" in bd.columns:
+            # createdTime is epoch seconds
+            now = time.time()
+            bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
+            # prefer exact symbol matches
+            sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
+            # apply where chain is Solana
+            mask_sol = df["chain"] == "Solana"
+            df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(
+                sym_age, left_on="symbol", right_on="symbol", how="left"
+            )["age_days"].values
+
+    # Fill unknown ages with a big number so the "Age (younger=better)" transform still works
+    df["age_days"] = df["age_days"].fillna(9999)
+
+    return df
+
+# -------------------- Load data based on mode --------------------
+if mode == "Demo (offline)":
+    data = load_demo()
+else:
+    st.info("Fetching live data… (DexScreener; Birdeye optional for Solana age).")
+    data = load_live(chains)
+    if data.empty:
+        st.warning("Live fetch returned no rows. Falling back to Demo.")
+        data = load_demo()
+
+# Ensure required columns exist
 required_cols = [
     "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
     "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
@@ -80,7 +198,7 @@ required_cols = [
 ]
 missing = [c for c in required_cols if c not in data.columns]
 if missing:
-    st.error(f"The dataset is missing columns: {missing}")
+    st.error(f"Missing columns in dataset: {missing}")
     st.stop()
 
 df = data.copy()
@@ -102,29 +220,19 @@ filtered = apply_filters(df)
 
 # If filters eliminate everything, auto-relax so the user still sees results
 if filtered.empty:
-    st.warning("No projects match your filters. I’ll relax thresholds so you can see results. "
-               "Try lowering min liquidity/volume or turning off the lock requirement.")
-    # Relax strategy: drop lock requirement, lower thresholds to 25% of input
+    st.warning("No projects match your filters. Relaxing thresholds so you can see results.")
     relaxed = df.copy()
     relaxed = relaxed[relaxed["chain"].isin(chains)]
     relaxed = relaxed[relaxed["liquidity_usd"] >= max(0, min_liq * 0.25)]
     relaxed = relaxed[relaxed["volume24h_usd"] >= max(0, min_vol * 0.25)]
-    relaxed = relaxed[relaxed["age_days"] <= max_age if max_age > 0 else relaxed["age_days"].max()]
-    filtered = relaxed  # show relaxed results
+    relaxed = relaxed[relaxed["age_days"] <= (max_age if max_age > 0 else relaxed["age_days"].max())]
+    filtered = relaxed
 
 if filtered.empty:
-    st.error("Still no data to show after relaxing. Please broaden your filters.")
+    st.error("Still no data after relaxing. Try lowering min liquidity/volume, or unchecking lock requirement.")
     st.stop()
 
 # -------------------- Scoring --------------------
-def minmax(s, invert=False):
-    s = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    if s.max() == s.min():
-        norm = pd.Series(0.5, index=s.index)
-    else:
-        norm = (s - s.min()) / (s.max() - s.min())
-    return 1 - norm if invert else norm
-
 scored = filtered.copy()
 scored["score"] = (
     weights["w_liq"]  * minmax(scored["liquidity_usd"]) +
@@ -154,7 +262,6 @@ st.markdown("### 📊 Visual Overview")
 tab1, tab2, tab3 = st.tabs(["Overview", "Details", "Notes"])
 
 with tab1:
-    # Metric cards for top 3
     top3 = ranked.head(3)
     cols = st.columns(3)
     for i, (_, r) in enumerate(top3.iterrows()):
@@ -184,7 +291,6 @@ with tab1:
         st.plotly_chart(fig_scatter, use_container_width=True)
 
 with tab2:
-    # Safe selection logic
     options = ranked["name"].tolist()
     if not options:
         st.warning("No projects available after filters. Adjust filters above.")
@@ -209,7 +315,6 @@ with tab2:
         st.metric("Age", int(row['age_days']))
         st.metric("Txns24h", int(row['txns24h']))
 
-    # Radar chart
     def _norm(col, invert=False):
         return float(minmax(ranked[col], invert).loc[ranked["name"] == sel])
 
