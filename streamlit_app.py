@@ -1,16 +1,9 @@
-# Try again with safe quoting: outer triple double, inner triple single quotes
-import os
 
-base = "/mnt/data/memecoin_dashboard"
-os.makedirs(base, exist_ok=True)
-
-app_code = """
 import os, math, json, requests, pandas as pd, numpy as np, streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 
-# -------------------- Page setup & style --------------------
 st.set_page_config(page_title="Memecoin Dashboard", layout="wide")
 st.markdown('''
 <style>
@@ -24,7 +17,7 @@ st.caption("Discover • Score • Track — with safe defaults and visuals")
 
 load_dotenv()
 
-# -------------------- Controls --------------------
+# Controls
 mode = st.radio("Data source mode", ["Demo (offline)"], horizontal=True)
 chains = st.multiselect("Chains", ["Ethereum", "Solana", "BSC"], default=["Ethereum","Solana","BSC"])
 
@@ -45,24 +38,14 @@ for i,(k,lab) in enumerate(labels):
 wtot=sum(weights.values()) or 1
 for k in weights: weights[k]=weights[k]/wtot
 
-# -------------------- Load demo data --------------------
+# Load demo data from local file in repo
 @st.cache_data
 def load_demo():
-    try:
-        return pd.read_csv("sample_data.csv")
-    except FileNotFoundError:
-        st.error("sample_data.csv not found in app directory. Make sure it's committed alongside streamlit_app.py.")
-        return pd.DataFrame(columns=[
-            "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
-            "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
-            "top10_holders_pct","telegram_members","twitter_followers","sentiment_score"
-        ])
+    return pd.read_csv("sample_data.csv")
 
 df=load_demo()
-if df.empty:
-    st.stop()
 
-# -------------------- Filtering --------------------
+# Filtering
 df=df[df["chain"].isin(chains)]
 df=df[df["liquidity_usd"]>=min_liq]
 df=df[df["volume24h_usd"]>=min_vol]
@@ -73,11 +56,6 @@ hide_honeypots=st.checkbox("Hide suspected honeypots",value=True)
 if "is_honeypot" in df.columns and hide_honeypots:
     df=df[~df["is_honeypot"].fillna(False)]
 
-if df.empty:
-    st.warning("No projects match your filters. Lower thresholds or disable some filters to see results.")
-    st.stop()
-
-# -------------------- Scoring --------------------
 def minmax(s,invert=False):
     s=pd.to_numeric(s, errors="coerce").fillna(0.0)
     if s.max()==s.min():
@@ -95,7 +73,7 @@ df["score"]=(
     weights["w_lock"]*minmax(df["liquidity_locked_pct"])+
     weights["w_top10"]*(1-minmax(df["top10_holders_pct"]))+
     weights["w_sent"]*minmax(df["sentiment_score"])+
-    weights["w_security"]*(1-minmax(df["is_honeypot"].astype(int) if "is_honeypot" in df else 0))
+    weights["w_security"]*(1-minmax(df["is_honeypot"].astype(int)))
 ).round(3)
 
 ranked=df.sort_values("score",ascending=False).reset_index(drop=True)
@@ -109,12 +87,10 @@ st.dataframe(
     use_container_width=True
 )
 
-# -------------------- Visual Overview --------------------
 st.markdown("### 📊 Visual Overview")
 tab1,tab2,tab3=st.tabs(["Overview","Details","Notes"])
 
 with tab1:
-    # Metric cards for top 3
     cols=st.columns(3)
     for i,(_,r) in enumerate(ranked.head(3).iterrows()):
         with cols[i]:
@@ -149,7 +125,6 @@ with tab2:
         st.metric("Age",int(row['age_days']))
         st.metric("Txns24h",int(row['txns24h']))
 
-    # Radar chart
     def _get_norm(col, invert=False):
         return float(minmax(df[col], invert).loc[df["name"]==sel])
 
@@ -173,8 +148,3 @@ with tab3:
         file_name="memecoin_ranked_export.csv",
         mime="text/csv"
     )
-"""
-with open(os.path.join(base, "streamlit_app.py"), "w") as f:
-    f.write(app_code)
-
-"/mnt/data/memecoin_dashboard/streamlit_app.py"
