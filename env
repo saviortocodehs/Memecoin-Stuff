@@ -2,7 +2,7 @@
 # API keys and secrets for your Memecoin Dashboard
 
 # Birdeye API (optional but recommended for Solana/Pump.fun data)
-BIRDEYE_API_KEY=your_birdeye_api_key_here
+BIRDEYE_API_KEY=d03f16b60f8e4629a0dec6c32799e78a
 
 # If you later add other integrations, you can keep them here:
 # DEXSCREENER_API_KEY=...
