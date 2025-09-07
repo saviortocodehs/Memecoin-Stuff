@@ -1,0 +1,9 @@
+# .env
+# API keys and secrets for your Memecoin Dashboard
+
+# Birdeye API (optional but recommended for Solana/Pump.fun data)
+BIRDEYE_API_KEY=your_birdeye_api_key_here
+
+# If you later add other integrations, you can keep them here:
+# DEXSCREENER_API_KEY=...
+# GOPLUS_API_KEY=...
