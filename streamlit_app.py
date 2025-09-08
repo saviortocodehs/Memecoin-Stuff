@@ -123,6 +123,14 @@ def rows_from_pairs(pairs, chains_selected):
         ))
     return rows
 
+def pick_row_by_name(ranked_df: pd.DataFrame, name_value: str):
+    """Return (row_series, row_index); fallback to first row."""
+    if ranked_df.empty:
+        return pd.Series(dtype="object"), -1
+    matched = ranked_df.index[ranked_df["name"] == name_value]
+    idx = int(matched[0]) if len(matched) else int(ranked_df.index[0])
+    return ranked_df.loc[idx], idx
+
 # ---------- Data loaders ----------
 @st.cache_data
 def load_demo():
@@ -327,36 +335,41 @@ with tab2:
     if ranked.empty:
         st.info("No selection available.")
     else:
-        options = ranked["name"].tolist()
+        options = ranked["name"].astype(str).tolist()
         sel = st.selectbox("Pick a project", options)
-        if sel not in options: sel = options[0]
-        row = ranked.loc[ranked["name"] == sel]
-        if row.empty: row = ranked.iloc[[0]]
-        row = row.iloc[0]
+        row, idx = pick_row_by_name(ranked, sel)
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Score", row["score"])
-            st.metric("Price", f"${float(row['price'] or 0):.10f}")
+            st.metric("Score", float(row.get("score", 0)))
+            st.metric("Price", f"${float(row.get('price', 0) or 0):.10f}")
         with col2:
-            st.metric("Liquidity", f"${float(row['liquidity_usd']):,.0f}")
-            st.metric("Mcap", f"${float(row['mcap_usd']):,.0f}")
+            st.metric("Liquidity", f"${float(row.get('liquidity_usd', 0) or 0):,.0f}")
+            st.metric("Mcap", f"${float(row.get('mcap_usd', 0) or 0):,.0f}")
         with col3:
-            st.metric("Age", int(float(row['age_days'] or 0)))
-            st.metric("Txns24h", int(row['txns24h'] or 0))
+            st.metric("Age", int(float(row.get('age_days', 0) or 0)))
+            st.metric("Txns24h", int(float(row.get('txns24h', 0) or 0)))
 
         def _norm(col, invert=False):
-            return float(minmax(ranked[col], invert).loc[ranked["name"] == sel])
-        radar_vals = {"Liquidity": _norm("liquidity_usd"),
-                      "Volume": _norm("volume24h_usd"),
-                      "Txns": _norm("txns24h"),
-                      "Lock%": _norm("liquidity_locked_pct"),
-                      "Top10(↓)": _norm("top10_holders_pct", invert=True),
-                      "Sentiment": _norm("sentiment_score")}
+            s_norm = minmax(ranked[col], invert)  # 0..1 series
+            try:
+                return float(s_norm.loc[idx])
+            except Exception:
+                v = pd.to_numeric(ranked.loc[idx, col], errors="coerce")
+                return float(0.5 if pd.isna(v) else v)
+
+        radar_vals = {
+            "Liquidity": _norm("liquidity_usd"),
+            "Volume": _norm("volume24h_usd"),
+            "Txns": _norm("txns24h"),
+            "Lock%": _norm("liquidity_locked_pct"),
+            "Top10(↓)": _norm("top10_holders_pct", invert=True),
+            "Sentiment": _norm("sentiment_score"),
+        }
         theta = list(radar_vals.keys())
         rvals = list(radar_vals.values()) + [list(radar_vals.values())[0]]
         fig = go.Figure(data=[go.Scatterpolar(r=rvals, theta=theta + [theta[0]],
-                                              fill='toself', name=sel)])
+                                              fill='toself', name=row.get("name","-"))])
         fig.update_layout(title="Attribute Radar",
                           polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
         st.plotly_chart(fig, use_container_width=True)
