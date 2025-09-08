@@ -17,7 +17,7 @@ h1 {background: linear-gradient(90deg, #7C4DFF, #4DD0E1);
 </style>
 ''', unsafe_allow_html=True)
 st.title("🚀 Memecoin Dashboard — Best Build")
-st.caption("Bigger demo, safer defaults, robust Live mode, diagnostics")
+st.caption("Bigger demo, safer defaults, robust Live mode, dedupe, diagnostics")
 load_dotenv()
 
 # ---------- Controls ----------
@@ -41,8 +41,7 @@ weights={}
 labels=[("w_liq","Liquidity"),("w_vol","24h Volume"),("w_tx","Txns"),("w_age","Age (younger=better)"),
         ("w_lock","Liquidity Locked %"),("w_top10","Top-10 Holders % (lower better)"),("w_sent","Sentiment"),("w_security","Security")]
 for i,(k,lab) in enumerate(labels):
-    with st.columns(4)[i%4]:
-        weights[k]=st.slider(lab,0,100,defaults[k],1)
+    with st.columns(4)[i%4]: weights[k]=st.slider(lab,0,100,defaults[k],1)
 wtot=sum(weights.values()) or 1
 for k in weights: weights[k]=weights[k]/wtot
 
@@ -76,7 +75,7 @@ def to_int_txns_h24(tx):
     if tx is None: return 0
     if isinstance(tx, dict):
         h24 = tx.get("h24", 0)
-        if isinstance(h24, dict):  # {'buys': X, 'sells': Y}
+        if isinstance(h24, dict):
             total = 0
             for v in h24.values():
                 try: total += int(v or 0)
@@ -99,24 +98,33 @@ def std_cols():
     return pd.DataFrame(columns=[
         "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
         "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
-        "top10_holders_pct","telegram_members","twitter_followers","sentiment_score"
+        "top10_holders_pct","telegram_members","twitter_followers","sentiment_score",
+        "base_address","pair_url","dex_id"
     ])
 
 def rows_from_pairs(pairs, chains_selected):
+    """Pull richer metadata so we can dedupe and link out."""
     rows = []
     for p in pairs:
         chain = normalize_chain(p.get("chainId", ""))
         if chains_selected and chain not in chains_selected: continue
+
+        base = p.get("baseToken") or {}
+        name  = base.get("name") or base.get("symbol") or "Unknown"
+        sym   = base.get("symbol") or "?"
+        addr  = base.get("address") or ""
+        url   = p.get("url") or ""
+        dex   = p.get("dexId") or ""
+
         rows.append(dict(
-            name=(p.get("baseToken") or {}).get("name") or (p.get("baseToken") or {}).get("symbol") or "Unknown",
-            symbol=(p.get("baseToken") or {}).get("symbol") or "?",
-            chain=chain,
+            name=name, symbol=sym, chain=chain,
+            base_address=addr, pair_url=url, dex_id=dex,
             price=to_float(p.get("priceUsd")),
             liquidity_usd=to_float((p.get("liquidity") or {}).get("usd", 0)),
             volume24h_usd=to_float((p.get("volume") or {}).get("h24", 0)),
             txns24h=to_int_txns_h24(p.get("txns")),
             mcap_usd=to_float(p.get("fdv")),
-            age_days=np.nan,  # may enrich later
+            age_days=np.nan,
             is_honeypot=False, owner_renounced=False,
             liquidity_locked_pct=np.nan, top10_holders_pct=np.nan,
             telegram_members=np.nan, twitter_followers=np.nan, sentiment_score=np.nan
@@ -154,7 +162,7 @@ def load_live(chains_selected):
         if "Solana" in chains_selected:  queries.append("solana")
         if "Ethereum" in chains_selected: queries.append("ethereum")
         if "BSC" in chains_selected:      queries.append("bsc")
-        if not queries:                   queries = ["solana","ethereum","bsc"]
+        if not queries: queries = ["solana","ethereum","bsc"]
         for q in queries:
             js2, err2 = safe_get(f"https://api.dexscreener.com/latest/dex/search?q={q}")
             if err2: meta["errors"].append(f"search({q}): {err2}")
@@ -208,10 +216,34 @@ if data.empty:
         meta["errors"].append(f"demo_read: {e}")
         st.error("No data available (live and demo both failed)."); st.write("Diagnostics:", meta)
 
+# ---------- Cleanup: dedupe & generic names ----------
+if not data.empty:
+    data["symbol"] = data["symbol"].astype(str).str.upper().str.strip()
+    data["name"]   = data["name"].astype(str).str.strip()
+
+    # Drop generic spam names
+    bad_names = {"SOLANA","ETHEREUM","BSC","BNB","ETH"}
+    data = data[~data["name"].str.upper().isin(bad_names)]
+
+    # Prefer the highest 24h volume per (chain, symbol)
+    # (Switch to ["chain","base_address"] for stricter dedupe if base_address is consistently present)
+    if "volume24h_usd" in data.columns:
+        try:
+            best_idx = (
+                data.groupby(["chain","symbol"])["volume24h_usd"]
+                .idxmax()
+                .dropna()
+                .astype(int)
+            )
+            data = data.loc[best_idx].reset_index(drop=True)
+        except Exception:
+            data = data.reset_index(drop=True)
+
 # Ensure columns exist
 required_cols = ["name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
     "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
-    "top10_holders_pct","telegram_members","twitter_followers","sentiment_score"]
+    "top10_holders_pct","telegram_members","twitter_followers","sentiment_score",
+    "base_address","pair_url","dex_id"]
 for c in required_cols:
     if c not in data.columns: data[c] = np.nan
 
@@ -291,8 +323,11 @@ if ranked.empty:
     st.error("No rows to display. Lower thresholds, set Max Age to 0, or show all demo rows.")
 else:
     st.dataframe(
-        ranked[["score","name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
-                "mcap_usd","age_days","liquidity_locked_pct","top10_holders_pct","sentiment_score"]],
+        ranked[[
+            "score","name","symbol","chain","price",
+            "liquidity_usd","volume24h_usd","txns24h","mcap_usd","age_days",
+            "dex_id","pair_url","base_address"
+        ]],
         use_container_width=True
     )
 
@@ -312,7 +347,6 @@ with tab1:
                 st.metric("Score", f"{r['score']:.3f}")
                 st.metric("Liquidity", f"${float(r['liquidity_usd']):,.0f}")
                 st.metric("24h Volume", f"${float(r['volume24h_usd']):,.0f}")
-                st.metric("Top-10 Holders %", f"{float(r.get('top10_holders_pct', 0)):.1f}%")
 
         c1, c2 = st.columns(2)
         with c1:
@@ -374,9 +408,16 @@ with tab2:
                           polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
         st.plotly_chart(fig, use_container_width=True)
 
+        # Quick links
+        if isinstance(row.get("pair_url"), str) and row.get("pair_url"):
+            st.link_button("Open on DEX", row.get("pair_url"))
+
 with tab3:
     st.markdown("Use this tab as your trading journal — jot down entry/exit notes, catalysts, risks, etc.")
     if not ranked.empty:
-        st.download_button("Export current table (CSV)",
+        st.download_button(
+            "Export current table (CSV)",
             ranked.to_csv(index=False).encode("utf-8"),
-            file_name="memecoin_ranked_export.csv", mime="text/csv")
+            file_name="memecoin_ranked_export.csv",
+            mime="text/csv"
+        )
