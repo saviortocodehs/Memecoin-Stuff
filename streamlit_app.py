@@ -1,5 +1,5 @@
 # streamlit_app.py
-import os, time, math, json, requests
+import os, time, json, requests
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -20,7 +20,7 @@ h1 {background: linear-gradient(90deg, #7C4DFF, #4DD0E1);
 st.title("🚀 Memecoin Dashboard — Beginner Edition")
 st.caption("Discover • Score • Track — Demo & Live modes with visuals")
 
-load_dotenv()  # loads .env locally; in Streamlit Cloud use Secrets
+load_dotenv()  # for local .env; in Streamlit Cloud use Secrets
 
 # -------------------- Controls --------------------
 mode = st.radio("Data source mode", ["Demo (offline)", "Live (internet)"], horizontal=True)
@@ -83,6 +83,41 @@ def normalize_chain(cid: str) -> str:
     if cid in ("bsc","bnb"):      return "BSC"
     return cid.capitalize() if cid else "Unknown"
 
+def to_float(x):
+    """Safely coerce common DexScreener shapes to float."""
+    try:
+        if isinstance(x, dict):
+            # Often {"usd": value}
+            if "usd" in x: return float(x.get("usd") or 0)
+            # Fall back to any numeric value inside
+            for v in x.values():
+                try: return float(v)
+                except: pass
+            return 0.0
+        if x is None: return 0.0
+        return float(x)
+    except:
+        return 0.0
+
+def to_int_txns_h24(tx):
+    """DexScreener txns.h24 can be number or dict like {'buys': X, 'sells': Y}."""
+    if tx is None: return 0
+    if isinstance(tx, dict):
+        h24 = tx.get("h24", 0)
+        if isinstance(h24, dict):
+            total = 0
+            for v in h24.values():
+                try: total += int(v or 0)
+                except: pass
+            return total
+        try: return int(h24 or 0)
+        except: return 0
+    try:
+        # Sometimes tx is already the h24 number
+        return int(tx or 0)
+    except:
+        return 0
+
 def safe_get(url, headers=None, params=None, timeout=20):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=timeout)
@@ -103,22 +138,24 @@ def _rows_from_dexscreener_pairs(pairs, chains_selected):
         chain = normalize_chain(p.get("chainId", ""))
         if chains_selected and chain not in chains_selected:
             continue
-        liq_usd = (p.get("liquidity") or {}).get("usd") or 0
-        vol24  = (p.get("volume") or {}).get("h24") or 0
-        tx24   = (p.get("txns") or {}).get("h24") or 0
-        fdv    = p.get("fdv") or 0
-        price  = p.get("priceUsd") or 0
-        base   = p.get("baseToken") or {}
-        name   = base.get("name") or base.get("symbol") or "Unknown"
-        sym    = base.get("symbol") or "?"
+
+        liq_usd = to_float((p.get("liquidity") or {}).get("usd", 0))
+        vol24   = to_float((p.get("volume") or {}).get("h24", 0))
+        tx24    = to_int_txns_h24(p.get("txns"))
+        fdv     = to_float(p.get("fdv"))
+        price   = to_float(p.get("priceUsd"))
+        base    = p.get("baseToken") or {}
+        name    = base.get("name") or base.get("symbol") or "Unknown"
+        sym     = base.get("symbol") or "?"
+
         rows.append(dict(
             name=name, symbol=sym, chain=chain,
-            price=float(price or 0),
-            liquidity_usd=float(liq_usd or 0),
-            volume24h_usd=float(vol24 or 0),
-            txns24h=int(tx24 or 0),
-            mcap_usd=float(fdv or 0),
-            age_days=np.nan,                # fill later
+            price=price,
+            liquidity_usd=liq_usd,
+            volume24h_usd=vol24,
+            txns24h=tx24,
+            mcap_usd=fdv,
+            age_days=np.nan,                # fill later if possible
             is_honeypot=False, owner_renounced=False,
             liquidity_locked_pct=np.nan, top10_holders_pct=np.nan,
             telegram_members=np.nan, twitter_followers=np.nan,
@@ -131,17 +168,17 @@ def load_live(chains_selected):
     """
     Live mode with robust fallbacks:
     1) DexScreener trending
-    2) If empty, DexScreener search per chain (solana/ethereum/bsc)
+    2) If empty, DexScreener search per chain (solana / ethereum / bsc)
     3) Optional Birdeye (if key) to estimate age_days for Solana
     """
     all_rows = []
 
-    # --- 1) Try trending
+    # --- 1) trending
     ds_tr = safe_get("https://api.dexscreener.com/latest/dex/trending") or {}
     pairs = ds_tr.get("pairs", []) if isinstance(ds_tr, dict) else []
     all_rows += _rows_from_dexscreener_pairs(pairs, chains_selected)
 
-    # --- 2) If nothing, try search per chain
+    # --- 2) search fallback
     if not all_rows:
         queries = []
         if "Solana" in chains_selected:  queries.append("solana")
@@ -224,121 +261,3 @@ if filtered.empty:
     relaxed = df.copy()
     relaxed = relaxed[relaxed["chain"].isin(chains)]
     relaxed = relaxed[relaxed["liquidity_usd"] >= max(0, min_liq * 0.25)]
-    relaxed = relaxed[relaxed["volume24h_usd"] >= max(0, min_vol * 0.25)]
-    relaxed = relaxed[relaxed["age_days"] <= (max_age if max_age > 0 else relaxed["age_days"].max())]
-    filtered = relaxed
-
-if filtered.empty:
-    st.error("Still no data after relaxing. Try lowering min liquidity/volume, or unchecking lock requirement.")
-    st.stop()
-
-# -------------------- Scoring --------------------
-scored = filtered.copy()
-scored["score"] = (
-    weights["w_liq"]  * minmax(scored["liquidity_usd"]) +
-    weights["w_vol"]  * minmax(scored["volume24h_usd"]) +
-    weights["w_tx"]   * minmax(scored["txns24h"]) +
-    weights["w_age"]  * (1 - minmax(scored["age_days"])) +
-    weights["w_lock"] * minmax(scored["liquidity_locked_pct"]) +
-    weights["w_top10"]* (1 - minmax(scored["top10_holders_pct"])) +
-    weights["w_sent"] * minmax(scored["sentiment_score"]) +
-    weights["w_security"] * (1 - minmax(scored["is_honeypot"].astype(int)))
-).round(3)
-
-ranked = scored.sort_values("score", ascending=False).reset_index(drop=True)
-
-# -------------------- Table --------------------
-st.markdown("### Ranked Results")
-st.dataframe(
-    ranked[[
-        "score","name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
-        "mcap_usd","age_days","liquidity_locked_pct","top10_holders_pct","sentiment_score"
-    ]],
-    use_container_width=True
-)
-
-# -------------------- Visual Overview --------------------
-st.markdown("### 📊 Visual Overview")
-tab1, tab2, tab3 = st.tabs(["Overview", "Details", "Notes"])
-
-with tab1:
-    top3 = ranked.head(3)
-    cols = st.columns(3)
-    for i, (_, r) in enumerate(top3.iterrows()):
-        with cols[i]:
-            st.subheader(f"{r['name']} ({r['symbol']})")
-            st.metric("Score", f"{r['score']:.3f}")
-            st.metric("Liquidity", f"${r['liquidity_usd']:,.0f}")
-            st.metric("24h Volume", f"${r['volume24h_usd']:,.0f}")
-            st.metric("Top-10 Holders %", f"{float(r.get('top10_holders_pct', 0)):.1f}%")
-
-    c1, c2 = st.columns(2)
-    with c1:
-        top_vol = ranked.nlargest(10, "volume24h_usd")[["name","volume24h_usd","score"]]
-        fig_bar = px.bar(top_vol, x="name", y="volume24h_usd",
-                         hover_data=["score"], title="Top 10 by 24h Volume")
-        fig_bar.update_layout(xaxis_title="", yaxis_title="24h Volume (USD)")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    with c2:
-        fig_scatter = px.scatter(
-            ranked.head(100),
-            x="liquidity_usd", y="volume24h_usd",
-            size="mcap_usd", color="score",
-            hover_name="name", title="Liquidity vs Volume"
-        )
-        fig_scatter.update_layout(xaxis_title="Liquidity (USD)", yaxis_title="24h Volume (USD)")
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-with tab2:
-    options = ranked["name"].tolist()
-    if not options:
-        st.warning("No projects available after filters. Adjust filters above.")
-        st.stop()
-    sel = st.selectbox("Pick a project", options)
-    if sel not in options:
-        sel = options[0]
-    row = ranked.loc[ranked["name"] == sel]
-    if row.empty:
-        row = ranked.iloc[[0]]
-        sel = row.iloc[0]["name"]
-    row = row.iloc[0]
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Score", row["score"])
-        st.metric("Price", f"${float(row['price']):.10f}")
-    with col2:
-        st.metric("Liquidity", f"${float(row['liquidity_usd']):,.0f}")
-        st.metric("Mcap", f"${float(row['mcap_usd']):,.0f}")
-    with col3:
-        st.metric("Age", int(row['age_days']))
-        st.metric("Txns24h", int(row['txns24h']))
-
-    def _norm(col, invert=False):
-        return float(minmax(ranked[col], invert).loc[ranked["name"] == sel])
-
-    radar_vals = {
-        "Liquidity": _norm("liquidity_usd"),
-        "Volume": _norm("volume24h_usd"),
-        "Txns": _norm("txns24h"),
-        "Lock%": _norm("liquidity_locked_pct"),
-        "Top10(↓)": _norm("top10_holders_pct", invert=True),
-        "Sentiment": _norm("sentiment_score"),
-    }
-    theta = list(radar_vals.keys())
-    rvals = list(radar_vals.values()) + [list(radar_vals.values())[0]]
-    fig = go.Figure(data=[go.Scatterpolar(r=rvals, theta=theta + [theta[0]],
-                                          fill='toself', name=sel)])
-    fig.update_layout(title="Attribute Radar",
-                      polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
-    st.plotly_chart(fig, use_container_width=True)
-
-with tab3:
-    st.markdown("Use this tab as your trading journal — jot down entry/exit reasoning, catalysts, risks, etc.")
-    st.download_button(
-        "Export current table (CSV)",
-        data=ranked.to_csv(index=False).encode("utf-8"),
-        file_name="memecoin_ranked_export.csv",
-        mime="text/csv"
-    )
