@@ -1,8 +1,7 @@
 # streamlit_app.py
-import os, math, json, time
+import os, time, math, json, requests
 import pandas as pd
 import numpy as np
-import requests
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -71,7 +70,6 @@ def minmax(s, invert=False):
     return 1 - norm if invert else norm
 
 def std_cols():
-    """Return empty DataFrame with the standard schema we use."""
     return pd.DataFrame(columns=[
         "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
         "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
@@ -85,7 +83,7 @@ def normalize_chain(cid: str) -> str:
     if cid in ("bsc","bnb"):      return "BSC"
     return cid.capitalize() if cid else "Unknown"
 
-def safe_get(url, headers=None, params=None, timeout=15):
+def safe_get(url, headers=None, params=None, timeout=20):
     try:
         r = requests.get(url, headers=headers, params=params, timeout=timeout)
         if r.status_code == 200:
@@ -99,35 +97,20 @@ def safe_get(url, headers=None, params=None, timeout=15):
 def load_demo():
     return pd.read_csv("sample_data.csv")
 
-@st.cache_data(ttl=180)
-def load_live(chains_selected):
-    """
-    Live mode:
-      - DexScreener trending pairs (no key) → base liquidity/volume/txns/mcap/price
-      - If BIRDEYE_API_KEY set, enrich SOL tokens with created time (age)
-    Returns DataFrame with our standard columns.
-    """
+def _rows_from_dexscreener_pairs(pairs, chains_selected):
     rows = []
-    # DexScreener trending
-    ds = safe_get("https://api.dexscreener.com/latest/dex/trending") or {}
-    pairs = ds.get("pairs", []) if isinstance(ds, dict) else []
-
-    for p in pairs[:200]:
+    for p in pairs:
         chain = normalize_chain(p.get("chainId", ""))
-        if chain not in chains_selected:  # respect filter early
+        if chains_selected and chain not in chains_selected:
             continue
-
         liq_usd = (p.get("liquidity") or {}).get("usd") or 0
         vol24  = (p.get("volume") or {}).get("h24") or 0
         tx24   = (p.get("txns") or {}).get("h24") or 0
         fdv    = p.get("fdv") or 0
         price  = p.get("priceUsd") or 0
-
-        base = p.get("baseToken") or {}
-        name = base.get("name") or base.get("symbol") or "Unknown"
-        sym  = base.get("symbol") or "?"
-
-        # placeholders; can be enriched later
+        base   = p.get("baseToken") or {}
+        name   = base.get("name") or base.get("symbol") or "Unknown"
+        sym    = base.get("symbol") or "?"
         rows.append(dict(
             name=name, symbol=sym, chain=chain,
             price=float(price or 0),
@@ -135,49 +118,66 @@ def load_live(chains_selected):
             volume24h_usd=float(vol24 or 0),
             txns24h=int(tx24 or 0),
             mcap_usd=float(fdv or 0),
-            age_days=np.nan,                # will fill for Solana via Birdeye if possible
-            is_honeypot=False,              # needs security API (GoPlus) if you add it
-            owner_renounced=False,
-            liquidity_locked_pct=np.nan,    # needs locker/explorer API
-            top10_holders_pct=np.nan,       # needs explorer API
-            telegram_members=np.nan,
-            twitter_followers=np.nan,
+            age_days=np.nan,                # fill later
+            is_honeypot=False, owner_renounced=False,
+            liquidity_locked_pct=np.nan, top10_holders_pct=np.nan,
+            telegram_members=np.nan, twitter_followers=np.nan,
             sentiment_score=np.nan
         ))
+    return rows
 
-    df = pd.DataFrame(rows)
+@st.cache_data(ttl=180)
+def load_live(chains_selected):
+    """
+    Live mode with robust fallbacks:
+    1) DexScreener trending
+    2) If empty, DexScreener search per chain (solana/ethereum/bsc)
+    3) Optional Birdeye (if key) to estimate age_days for Solana
+    """
+    all_rows = []
+
+    # --- 1) Try trending
+    ds_tr = safe_get("https://api.dexscreener.com/latest/dex/trending") or {}
+    pairs = ds_tr.get("pairs", []) if isinstance(ds_tr, dict) else []
+    all_rows += _rows_from_dexscreener_pairs(pairs, chains_selected)
+
+    # --- 2) If nothing, try search per chain
+    if not all_rows:
+        queries = []
+        if "Solana" in chains_selected:  queries.append("solana")
+        if "Ethereum" in chains_selected: queries.append("ethereum")
+        if "BSC" in chains_selected:      queries.append("bsc")
+        if not queries:                   queries = ["solana","ethereum","bsc"]
+
+        for q in queries:
+            ds_s = safe_get(f"https://api.dexscreener.com/latest/dex/search?q={q}") or {}
+            pairs = ds_s.get("pairs", []) if isinstance(ds_s, dict) else []
+            all_rows += _rows_from_dexscreener_pairs(pairs, chains_selected)
+
+    df = pd.DataFrame(all_rows)
     if df.empty:
         return std_cols()
 
-    # Optional Birdeye enrichment (Solana age)
+    # --- 3) Optional: Birdeye to estimate age for Solana symbols
     birdeye_key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
     if birdeye_key and ("Solana" in df["chain"].unique()):
-        # Endpoint: tokens created recently (we'll just pull some and map by symbol/name best-effort)
-        # You can replace with a more precise endpoint if you have contract addresses.
         headers = {"X-API-KEY": birdeye_key}
-        # Try recent tokens list
         bj = safe_get(
             "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
             headers=headers
         ) or {}
         tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
         bd = pd.DataFrame(tokens)
-        # Map heuristically by symbol/name (imperfect but useful for rough age)
-        if not bd.empty and "symbol" in bd.columns and "createdTime" in bd.columns:
-            # createdTime is epoch seconds
+        if not bd.empty and {"symbol","createdTime"}.issubset(bd.columns):
             now = time.time()
             bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
-            # prefer exact symbol matches
             sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
-            # apply where chain is Solana
             mask_sol = df["chain"] == "Solana"
             df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(
-                sym_age, left_on="symbol", right_on="symbol", how="left"
+                sym_age, on="symbol", how="left"
             )["age_days"].values
 
-    # Fill unknown ages with a big number so the "Age (younger=better)" transform still works
     df["age_days"] = df["age_days"].fillna(9999)
-
     return df
 
 # -------------------- Load data based on mode --------------------
