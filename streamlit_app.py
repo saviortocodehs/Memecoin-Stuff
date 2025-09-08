@@ -8,7 +8,7 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 
 # ---------- Page ----------
-st.set_page_config(page_title="Memecoin Dashboard", layout="wide")
+st.set_page_config(page_title="Memecoin Advisor — Pump.fun + DEX", layout="wide")
 st.markdown('''
 <style>
 .block-container {padding-top: 2rem;}
@@ -22,17 +22,22 @@ h1 {background: linear-gradient(90deg, #7C4DFF, #4DD0E1);
 </style>
 ''', unsafe_allow_html=True)
 
-st.title("🚦 Memecoin Advisor — Signals & Scores")
-st.caption("Live + Demo • Dedupe • Safer filters • Verdicts (✅ BUYABLE / ⚠️ WATCH / ❌ AVOID)")
+st.title("🚦 Memecoin Advisor — Signals & Scores (Pump.fun + DEX)")
+st.caption("Pump.fun mode • Live DEX mode • Demo • Dedupe • Verdicts • Diagnostics")
 load_dotenv()
 
 # ---------- Controls ----------
-mode = st.radio("Data source mode", ["Demo (offline)", "Live (internet)"], horizontal=True)
-chains = st.multiselect("Chains", ["Ethereum", "Solana", "BSC"], default=["Ethereum","Solana","BSC"])
+mode = st.radio(
+    "Data source mode",
+    ["Demo (offline)", "Live (DexScreener)", "Pump.fun"],
+    horizontal=True
+)
+chains = st.multiselect("Chains (DEX mode only)", ["Ethereum", "Solana", "BSC"],
+                        default=["Ethereum","Solana","BSC"], disabled=(mode!="Live (DexScreener)"))
 
 is_demo = (mode == "Demo (offline)")
-def_liq = 5_000 if is_demo else 50_000
-def_vol = 1_000 if is_demo else 10_000
+def_liq = 5_000 if is_demo or mode=="Pump.fun" else 50_000
+def_vol = 1_000 if is_demo or mode=="Pump.fun" else 10_000
 def_lock = False
 
 colA, colB, colC, colD = st.columns(4)
@@ -83,7 +88,7 @@ def to_int_txns_h24(tx):
     if tx is None: return 0
     if isinstance(tx, dict):
         h24 = tx.get("h24", 0)
-        if isinstance(h24, dict):  # {'buys': X, 'sells': Y}
+        if isinstance(h24, dict):
             total = 0
             for v in h24.values():
                 try: total += int(v or 0)
@@ -102,6 +107,13 @@ def safe_get(url, headers=None, params=None, timeout=15):
     except Exception as e:
         return None, str(e)
 
+def pick_row_by_name(ranked_df: pd.DataFrame, name_value: str):
+    if ranked_df.empty: return pd.Series(dtype="object"), -1
+    matched = ranked_df.index[ranked_df["name"] == name_value]
+    idx = int(matched[0]) if len(matched) else int(ranked_df.index[0])
+    return ranked_df.loc[idx], idx
+
+# ---------- Row builders ----------
 def rows_from_pairs(pairs, chains_selected):
     rows = []
     for p in pairs:
@@ -127,28 +139,47 @@ def rows_from_pairs(pairs, chains_selected):
         ))
     return rows
 
-def pick_row_by_name(ranked_df: pd.DataFrame, name_value: str):
-    if ranked_df.empty: return pd.Series(dtype="object"), -1
-    matched = ranked_df.index[ranked_df["name"] == name_value]
-    idx = int(matched[0]) if len(matched) else int(ranked_df.index[0])
-    return ranked_df.loc[idx], idx
+def rows_from_pumpfun(coins):
+    rows = []
+    now = time.time()
+    for c in coins:
+        created_ts = c.get("createdTimestamp")
+        try:
+            age_days = (now - float(created_ts)) / 86400.0 if created_ts else 9999
+        except Exception:
+            age_days = 9999
+        rows.append(dict(
+            name=c.get("name") or c.get("symbol") or "Unknown",
+            symbol=c.get("symbol") or "?",
+            chain="Solana",
+            base_address=c.get("mint") or "",
+            pair_url=f"https://pump.fun/{c.get('mint')}" if c.get("mint") else "",
+            dex_id="pumpfun",
+            price=to_float(c.get("usdPrice")),
+            liquidity_usd=to_float(c.get("liquidity")),
+            volume24h_usd=to_float(c.get("volume24h")),
+            txns24h=to_int_txns_h24(c.get("txns")),
+            mcap_usd=to_float(c.get("marketCap")),
+            age_days=age_days,
+            is_honeypot=False, owner_renounced=False,
+            liquidity_locked_pct=np.nan, top10_holders_pct=np.nan,
+            telegram_members=np.nan, twitter_followers=np.nan, sentiment_score=np.nan
+        ))
+    return rows
 
 # ---------- Data loaders ----------
 @st.cache_data
 def load_demo():
-    # expects sample_data.csv in working dir
     return pd.read_csv("sample_data.csv")
 
 @st.cache_data(ttl=180)
-def load_live(chains_selected):
+def load_live_dex(chains_selected):
     meta = {"source": "dexscreener_trending", "errors": []}
     all_rows = []
-
     js, err = safe_get("https://api.dexscreener.com/latest/dex/trending")
     if err: meta["errors"].append(f"trending: {err}")
     pairs = js.get("pairs", []) if isinstance(js, dict) else []
     all_rows += rows_from_pairs(pairs, chains_selected)
-
     if not all_rows:
         meta["source"] = "dexscreener_search"
         queries = []
@@ -161,29 +192,31 @@ def load_live(chains_selected):
             if err2: meta["errors"].append(f"search({q}): {err2}")
             pairs2 = js2.get("pairs", []) if isinstance(js2, dict) else []
             all_rows += rows_from_pairs(pairs2, chains_selected)
-
     df = pd.DataFrame(all_rows)
     meta["rows_live"] = len(df)
-
-    # Optional: Birdeye age enrichment (if you add BIRDEYE_API_KEY)
-    key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
-    if key and not df.empty and "Solana" in df["chain"].unique():
-        headers = {"X-API-KEY": key}
-        bj, e3 = safe_get(
-            "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
-            headers=headers
-        )
-        if e3: meta["errors"].append(f"birdeye: {e3}")
-        tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
-        bd = pd.DataFrame(tokens)
-        if not bd.empty and {"symbol","createdTime"}.issubset(bd.columns):
-            now = time.time()
-            bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
-            sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
-            mask_sol = df["chain"] == "Solana"
-            df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(sym_age, on="symbol", how="left")["age_days"].values
-
     df["age_days"] = df["age_days"].fillna(9999)
+    return df, meta
+
+@st.cache_data(ttl=60)
+def load_pumpfun():
+    # Common endpoints: trending / new / active
+    urls = [
+        "https://frontend-api.pump.fun/coins/trending",
+        # Uncomment if you want more sources mixed in:
+        # "https://frontend-api.pump.fun/coins/new",
+        # "https://frontend-api.pump.fun/coins/active"
+    ]
+    all_rows = []
+    meta = {"source":"pumpfun", "errors":[]}
+    for url in urls:
+        js, err = safe_get(url)
+        if err:
+            meta["errors"].append(f"{url}: {err}")
+            continue
+        coins = js if isinstance(js, list) else js.get("coins", [])
+        all_rows += rows_from_pumpfun(coins)
+    df = pd.DataFrame(all_rows)
+    meta["rows_live"] = len(df)
     return df, meta
 
 # ---------- Load ----------
@@ -192,21 +225,26 @@ if mode == "Demo (offline)":
     try: data = load_demo()
     except Exception as e:
         st.error(f"Could not read sample_data.csv: {e}"); data = pd.DataFrame()
-else:
-    st.info("Fetching live data… (DexScreener; Birdeye optional for Solana age).")
-    try: data, meta = load_live(chains)
+elif mode == "Pump.fun":
+    st.info("Fetching Pump.fun tokens…")
+    try: data, meta = load_pumpfun()
     except Exception as e:
-        meta["errors"].append(f"live_exception: {e}"); data = pd.DataFrame()
+        meta["errors"].append(f"pumpfun_exception: {e}"); data = pd.DataFrame()
+else:  # Live Dex
+    st.info("Fetching live DEX data… (DexScreener)")
+    try: data, meta = load_live_dex(chains)
+    except Exception as e:
+        meta["errors"].append(f"dex_exception: {e}"); data = pd.DataFrame()
 
-# Fallback to demo if live empty
+# Fallback to demo if empty
 if data.empty:
     try:
         data = load_demo()
-        st.warning("Live fetch returned no rows. Showing Demo data so the app stays usable.")
+        st.warning("Primary fetch returned no rows. Showing Demo data so the app stays usable.")
         meta["source"] = "demo_fallback"
     except Exception as e:
         meta["errors"].append(f"demo_read: {e}")
-        st.error("No data available (live and demo both failed)."); st.write("Diagnostics:", meta)
+        st.error("No data available (primary and demo both failed)."); st.write("Diagnostics:", meta)
 
 # ---------- Cleanup: dedupe & generic names ----------
 if not data.empty:
@@ -214,11 +252,16 @@ if not data.empty:
     data["name"]   = data["name"].astype(str).str.strip()
     bad_names = {"SOLANA","ETHEREUM","BSC","BNB","ETH"}
     data = data[~data["name"].str.upper().isin(bad_names)]
-    # Highest 24h volume per (chain, symbol)
+
+    # Prefer the most active entry per token
+    # For DEX data, use (chain, symbol). For Pump.fun (Solana-only), use base_address if available.
+    group_keys = ["chain","symbol"]
+    if mode == "Pump.fun" and "base_address" in data.columns and data["base_address"].notna().any():
+        group_keys = ["chain","base_address"]
     if "volume24h_usd" in data.columns:
         try:
             best_idx = (
-                data.groupby(["chain","symbol"])["volume24h_usd"]
+                data.groupby(group_keys)["volume24h_usd"]
                 .idxmax()
                 .dropna()
                 .astype(int)
@@ -273,16 +316,13 @@ def compute_verdict_row(r):
     # Honeypot / security
     if honeypot: reasons.append("❌ Honeypot/suspicious"); score -= 3
 
-    # Age (very optional; unknown kept neutral)
+    # Age (optional/soft)
     if 1 <= age <= 14: score += 1; reasons.append("🟩 Early but not newborn")
     elif age < 1: reasons.append("🟨 Newborn token (sniper risk)")
-    # else: older/unknown → neutral
 
-    # Map score → verdict
     if score >= 7: verdict = "✅ BUYABLE"
     elif score >= 4: verdict = "⚠️ WATCH"
     else: verdict = "❌ AVOID"
-
     return verdict, max(0, min(10, score)), reasons
 
 # ---------- Filtering ----------
@@ -290,21 +330,19 @@ show_all_demo = st.checkbox("Show all demo rows (ignore filters)", value=is_demo
 
 def apply_filters(df_in):
     if show_all_demo: return df_in.copy()
-
-    df1 = df_in[df_in["chain"].isin(chains)]
+    df1 = df_in.copy()
+    if mode == "Live (DexScreener)":
+        df1 = df1[df1["chain"].isin(chains)]
     df1 = df1[pd.to_numeric(df1["liquidity_usd"], errors="coerce").fillna(0) >= min_liq]
     df1 = df1[pd.to_numeric(df1["volume24h_usd"], errors="coerce").fillna(0) >= min_vol]
-
     # Age filter: 0 disables; unknown ages (NaN or 9999) are kept
     if max_age > 0:
         age = pd.to_numeric(df1["age_days"], errors="coerce")
         keep_unknown = age.isna() | (age >= 9999)
         keep_young  = age.le(max_age)
         df1 = df1[keep_unknown | keep_young]
-
     if require_locked and "liquidity_locked_pct" in df1.columns:
         df1 = df1[pd.to_numeric(df1["liquidity_locked_pct"], errors="coerce").fillna(0) >= 70]
-
     hide_honeypots = st.checkbox("Hide suspected honeypots", value=True)
     if "is_honeypot" in df1.columns and hide_honeypots:
         df1 = df1[~df1["is_honeypot"].fillna(False)]
@@ -312,7 +350,7 @@ def apply_filters(df_in):
 
 filtered = apply_filters(data)
 
-# Percentile-based auto-relax (no age filter here)
+# Percentile auto-relax (no age)
 relaxed_used = False
 if not show_all_demo and filtered.empty and not data.empty:
     relaxed_used = True
@@ -323,7 +361,8 @@ if not show_all_demo and filtered.empty and not data.empty:
     liq_p10 = q(data["liquidity_usd"], 0.10, 0)
     vol_p10 = q(data["volume24h_usd"], 0.10, 0)
     relaxed = data.copy()
-    relaxed = relaxed[relaxed["chain"].isin(chains)]
+    if mode == "Live (DexScreener)":
+        relaxed = relaxed[relaxed["chain"].isin(chains)]
     relaxed = relaxed[pd.to_numeric(relaxed["liquidity_usd"], errors="coerce").fillna(0) >= liq_p10]
     relaxed = relaxed[pd.to_numeric(relaxed["volume24h_usd"], errors="coerce").fillna(0) >= vol_p10]
     filtered = relaxed
@@ -341,19 +380,15 @@ scored["score"]=(weights["w_liq"]*minmax(scored["liquidity_usd"]) +
                  weights["w_security"]*(1-minmax(scored["is_honeypot"].fillna(False).astype(int)))).round(3)
 
 # ---------- Verdicts ----------
-verdicts = []
-scores10 = []
-reasons_col = []
+verdicts, scores10, reasons_col = [], [], []
 for _, r in scored.iterrows():
     v, s10, rs = compute_verdict_row(r)
-    verdicts.append(v)
-    scores10.append(s10)
-    reasons_col.append(" • ".join(rs))
+    verdicts.append(v); scores10.append(s10); reasons_col.append(" • ".join(rs))
 scored["signal_score_10"] = scores10
 scored["verdict"] = verdicts
 scored["reasons"] = reasons_col
 
-# Sort primarily by verdict class then by numeric score + volume
+# Sort by verdict class, then numeric score, then volume
 verdict_rank = scored["verdict"].map({"✅ BUYABLE":2, "⚠️ WATCH":1, "❌ AVOID":0}).fillna(0)
 ranked = scored.assign(_v=verdict_rank).sort_values(
     ["_v","score","volume24h_usd"], ascending=[False, False, False]
@@ -377,14 +412,12 @@ st.markdown("### Ranked Results with Verdicts")
 if ranked.empty:
     st.error("No rows to display. Lower thresholds, set Max Age to 0, or show all demo rows.")
 else:
-    # Pretty verdict badges
     def badge(v):
         if "BUYABLE" in v: return f'<span class="badge badge-green">{v}</span>'
         if "WATCH"   in v: return f'<span class="badge badge-yellow">{v}</span>'
         return f'<span class="badge badge-red">{v}</span>'
     show = ranked.copy()
     show["verdict"] = show["verdict"].apply(badge)
-    # Render HTML for verdict and link button (pair_url)
     show["pair"] = show["pair_url"].apply(lambda u: f'<a href="{u}" target="_blank">Open</a>' if isinstance(u,str) and u else "")
     cols = ["verdict","signal_score_10","score","name","symbol","chain","price",
             "liquidity_usd","volume24h_usd","txns24h","mcap_usd","reasons","dex_id","pair","base_address"]
@@ -470,11 +503,10 @@ with tab2:
         fig.update_layout(title="Attribute Radar", polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Reasons + quick link
         st.markdown("**Why this verdict:**")
         st.markdown(f"<div class='small'>{row.get('reasons','')}</div>", unsafe_allow_html=True)
         if isinstance(row.get("pair_url"), str) and row.get("pair_url"):
-            st.link_button("Open on DEX", row.get("pair_url"))
+            st.link_button("Open Pair / Pump.fun", row.get("pair_url"))
 
 with tab3:
     st.markdown("Use this tab as your trading journal — jot down entry/exit notes, catalysts, risks, etc.")
