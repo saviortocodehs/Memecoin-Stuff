@@ -14,10 +14,16 @@ st.markdown('''
 .block-container {padding-top: 2rem;}
 h1 {background: linear-gradient(90deg, #7C4DFF, #4DD0E1);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;}
+.small {font-size: 0.85rem; opacity: 0.9}
+.badge {padding: 2px 8px; border-radius: 9999px; font-weight: 700; white-space: nowrap}
+.badge-green {background:#16a34a22; color:#16a34a}
+.badge-yellow{background:#ca8a0422; color:#ca8a04}
+.badge-red{background:#dc262622; color:#dc2626}
 </style>
 ''', unsafe_allow_html=True)
-st.title("🚀 Memecoin Dashboard — Best Build")
-st.caption("Bigger demo, safer defaults, robust Live mode, dedupe, diagnostics")
+
+st.title("🚦 Memecoin Advisor — Signals & Scores")
+st.caption("Live + Demo • Dedupe • Safer filters • Verdicts (✅ BUYABLE / ⚠️ WATCH / ❌ AVOID)")
 load_dotenv()
 
 # ---------- Controls ----------
@@ -36,12 +42,14 @@ with colC: max_age = st.number_input("Max Age (days) — 0 disables", min_value=
 with colD: require_locked = st.checkbox("Require Liquidity Locked ≥ 70%", value=def_lock)
 
 st.subheader("Weights (normalized)")
-defaults = {"w_liq":20,"w_vol":20,"w_tx":10,"w_age":5,"w_lock":20,"w_top10":20,"w_sent":15,"w_security":10}
+defaults = {"w_liq":18,"w_vol":22,"w_tx":12,"w_age":8,"w_lock":18,"w_top10":14,"w_sent":6,"w_security":2}
 weights={}
-labels=[("w_liq","Liquidity"),("w_vol","24h Volume"),("w_tx","Txns"),("w_age","Age (younger=better)"),
-        ("w_lock","Liquidity Locked %"),("w_top10","Top-10 Holders % (lower better)"),("w_sent","Sentiment"),("w_security","Security")]
+labels=[("w_liq","Liquidity"),("w_vol","24h Volume"),("w_tx","Txns"),
+        ("w_age","Age (younger=better)"),("w_lock","Liquidity Locked %"),
+        ("w_top10","Top-10 Holders % (lower better)"),("w_sent","Sentiment"),("w_security","Security")]
 for i,(k,lab) in enumerate(labels):
-    with st.columns(4)[i%4]: weights[k]=st.slider(lab,0,100,defaults[k],1)
+    with st.columns(4)[i%4]:
+        weights[k]=st.slider(lab,0,100,defaults[k],1)
 wtot=sum(weights.values()) or 1
 for k in weights: weights[k]=weights[k]/wtot
 
@@ -75,7 +83,7 @@ def to_int_txns_h24(tx):
     if tx is None: return 0
     if isinstance(tx, dict):
         h24 = tx.get("h24", 0)
-        if isinstance(h24, dict):
+        if isinstance(h24, dict):  # {'buys': X, 'sells': Y}
             total = 0
             for v in h24.values():
                 try: total += int(v or 0)
@@ -94,31 +102,19 @@ def safe_get(url, headers=None, params=None, timeout=15):
     except Exception as e:
         return None, str(e)
 
-def std_cols():
-    return pd.DataFrame(columns=[
-        "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
-        "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
-        "top10_holders_pct","telegram_members","twitter_followers","sentiment_score",
-        "base_address","pair_url","dex_id"
-    ])
-
 def rows_from_pairs(pairs, chains_selected):
-    """Pull richer metadata so we can dedupe and link out."""
     rows = []
     for p in pairs:
         chain = normalize_chain(p.get("chainId", ""))
         if chains_selected and chain not in chains_selected: continue
-
         base = p.get("baseToken") or {}
-        name  = base.get("name") or base.get("symbol") or "Unknown"
-        sym   = base.get("symbol") or "?"
-        addr  = base.get("address") or ""
-        url   = p.get("url") or ""
-        dex   = p.get("dexId") or ""
-
         rows.append(dict(
-            name=name, symbol=sym, chain=chain,
-            base_address=addr, pair_url=url, dex_id=dex,
+            name=base.get("name") or base.get("symbol") or "Unknown",
+            symbol=base.get("symbol") or "?",
+            chain=chain,
+            base_address=base.get("address") or "",
+            pair_url=p.get("url") or "",
+            dex_id=p.get("dexId") or "",
             price=to_float(p.get("priceUsd")),
             liquidity_usd=to_float((p.get("liquidity") or {}).get("usd", 0)),
             volume24h_usd=to_float((p.get("volume") or {}).get("h24", 0)),
@@ -132,9 +128,7 @@ def rows_from_pairs(pairs, chains_selected):
     return rows
 
 def pick_row_by_name(ranked_df: pd.DataFrame, name_value: str):
-    """Return (row_series, row_index); fallback to first row."""
-    if ranked_df.empty:
-        return pd.Series(dtype="object"), -1
+    if ranked_df.empty: return pd.Series(dtype="object"), -1
     matched = ranked_df.index[ranked_df["name"] == name_value]
     idx = int(matched[0]) if len(matched) else int(ranked_df.index[0])
     return ranked_df.loc[idx], idx
@@ -142,6 +136,7 @@ def pick_row_by_name(ranked_df: pd.DataFrame, name_value: str):
 # ---------- Data loaders ----------
 @st.cache_data
 def load_demo():
+    # expects sample_data.csv in working dir
     return pd.read_csv("sample_data.csv")
 
 @st.cache_data(ttl=180)
@@ -149,13 +144,11 @@ def load_live(chains_selected):
     meta = {"source": "dexscreener_trending", "errors": []}
     all_rows = []
 
-    # 1) Trending
     js, err = safe_get("https://api.dexscreener.com/latest/dex/trending")
     if err: meta["errors"].append(f"trending: {err}")
     pairs = js.get("pairs", []) if isinstance(js, dict) else []
     all_rows += rows_from_pairs(pairs, chains_selected)
 
-    # 2) Fallback: search per chain
     if not all_rows:
         meta["source"] = "dexscreener_search"
         queries = []
@@ -172,26 +165,25 @@ def load_live(chains_selected):
     df = pd.DataFrame(all_rows)
     meta["rows_live"] = len(df)
 
-    # 3) Optional Birdeye age for Solana symbols
-    if not df.empty and "Solana" in df["chain"].unique():
-        key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
-        if key:
-            headers = {"X-API-KEY": key}
-            bj, e3 = safe_get(
-                "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
-                headers=headers
-            )
-            if e3: meta["errors"].append(f"birdeye: {e3}")
-            tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
-            bd = pd.DataFrame(tokens)
-            if not bd.empty and {"symbol","createdTime"}.issubset(bd.columns):
-                now = time.time()
-                bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
-                sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
-                mask_sol = df["chain"] == "Solana"
-                df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(sym_age, on="symbol", how="left")["age_days"].values
+    # Optional: Birdeye age enrichment (if you add BIRDEYE_API_KEY)
+    key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
+    if key and not df.empty and "Solana" in df["chain"].unique():
+        headers = {"X-API-KEY": key}
+        bj, e3 = safe_get(
+            "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
+            headers=headers
+        )
+        if e3: meta["errors"].append(f"birdeye: {e3}")
+        tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
+        bd = pd.DataFrame(tokens)
+        if not bd.empty and {"symbol","createdTime"}.issubset(bd.columns):
+            now = time.time()
+            bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
+            sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
+            mask_sol = df["chain"] == "Solana"
+            df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(sym_age, on="symbol", how="left")["age_days"].values
 
-    df["age_days"] = df["age_days"].fillna(9999)  # unknown
+    df["age_days"] = df["age_days"].fillna(9999)
     return df, meta
 
 # ---------- Load ----------
@@ -220,13 +212,9 @@ if data.empty:
 if not data.empty:
     data["symbol"] = data["symbol"].astype(str).str.upper().str.strip()
     data["name"]   = data["name"].astype(str).str.strip()
-
-    # Drop generic spam names
     bad_names = {"SOLANA","ETHEREUM","BSC","BNB","ETH"}
     data = data[~data["name"].str.upper().isin(bad_names)]
-
-    # Prefer the highest 24h volume per (chain, symbol)
-    # (Switch to ["chain","base_address"] for stricter dedupe if base_address is consistently present)
+    # Highest 24h volume per (chain, symbol)
     if "volume24h_usd" in data.columns:
         try:
             best_idx = (
@@ -246,6 +234,56 @@ required_cols = ["name","symbol","chain","price","liquidity_usd","volume24h_usd"
     "base_address","pair_url","dex_id"]
 for c in required_cols:
     if c not in data.columns: data[c] = np.nan
+
+# ---------- Advisor rules (verdicts) ----------
+def compute_verdict_row(r):
+    """Return (verdict_str, verdict_score_0_10, reasons_list)."""
+    liq   = float(pd.to_numeric(r.get("liquidity_usd"), errors="coerce") or 0)
+    vol   = float(pd.to_numeric(r.get("volume24h_usd"), errors="coerce") or 0)
+    tx    = float(pd.to_numeric(r.get("txns24h"), errors="coerce") or 0)
+    lockp = float(pd.to_numeric(r.get("liquidity_locked_pct"), errors="coerce") if pd.notna(r.get("liquidity_locked_pct")) else -1)
+    top10 = float(pd.to_numeric(r.get("top10_holders_pct"), errors="coerce") if pd.notna(r.get("top10_holders_pct")) else -1)
+    honeypot = bool(r.get("is_honeypot") or False)
+    age  = float(pd.to_numeric(r.get("age_days"), errors="coerce") or 9999)
+
+    score = 0
+    reasons = []
+
+    # Liquidity
+    if liq >= 50000: score += 2; reasons.append("✅ Liquidity ≥ $50k")
+    elif liq >= 20000: score += 1; reasons.append("🟨 Liquidity ≥ $20k")
+    else: reasons.append("❌ Very low liquidity")
+
+    # Volume + Txns momentum
+    if vol >= 25000 and tx >= 300: score += 2; reasons.append("✅ Healthy 24h volume & activity")
+    elif vol >= 10000 and tx >= 100: score += 1; reasons.append("🟨 Moderate 24h volume/txns")
+    else: reasons.append("❌ Weak demand")
+
+    # Lock / renounce (if provided)
+    if lockp >= 70: score += 2; reasons.append("✅ Liquidity locked ≥ 70%")
+    elif 0 <= lockp < 70: reasons.append("🟨 Low lock%")
+    else: reasons.append("🟨 Lock% unknown")
+
+    # Whale distribution (if provided)
+    if 0 <= top10 <= 25: score += 2; reasons.append("✅ Top10 holders ≤ 25%")
+    elif 25 < top10 <= 50: score += 1; reasons.append("🟨 Top10 holders ≤ 50%")
+    elif top10 > 50: reasons.append("❌ Concentrated holders")
+    else: reasons.append("🟨 Holder distribution unknown")
+
+    # Honeypot / security
+    if honeypot: reasons.append("❌ Honeypot/suspicious"); score -= 3
+
+    # Age (very optional; unknown kept neutral)
+    if 1 <= age <= 14: score += 1; reasons.append("🟩 Early but not newborn")
+    elif age < 1: reasons.append("🟨 Newborn token (sniper risk)")
+    # else: older/unknown → neutral
+
+    # Map score → verdict
+    if score >= 7: verdict = "✅ BUYABLE"
+    elif score >= 4: verdict = "⚠️ WATCH"
+    else: verdict = "❌ AVOID"
+
+    return verdict, max(0, min(10, score)), reasons
 
 # ---------- Filtering ----------
 show_all_demo = st.checkbox("Show all demo rows (ignore filters)", value=is_demo)
@@ -291,7 +329,7 @@ if not show_all_demo and filtered.empty and not data.empty:
     filtered = relaxed
     st.info({"auto_relax_thresholds": {"liquidity_min": round(liq_p10,2), "volume_min": round(vol_p10,2), "age_filter_applied": False}})
 
-# ---------- Scoring ----------
+# ---------- Scoring (numeric) ----------
 scored = filtered.copy()
 scored["score"]=(weights["w_liq"]*minmax(scored["liquidity_usd"]) +
                  weights["w_vol"]*minmax(scored["volume24h_usd"]) +
@@ -301,13 +339,30 @@ scored["score"]=(weights["w_liq"]*minmax(scored["liquidity_usd"]) +
                  weights["w_top10"]*(1-minmax(scored["top10_holders_pct"])) +
                  weights["w_sent"]*minmax(scored["sentiment_score"]) +
                  weights["w_security"]*(1-minmax(scored["is_honeypot"].fillna(False).astype(int)))).round(3)
-ranked = scored.sort_values("score", ascending=False).reset_index(drop=True)
+
+# ---------- Verdicts ----------
+verdicts = []
+scores10 = []
+reasons_col = []
+for _, r in scored.iterrows():
+    v, s10, rs = compute_verdict_row(r)
+    verdicts.append(v)
+    scores10.append(s10)
+    reasons_col.append(" • ".join(rs))
+scored["signal_score_10"] = scores10
+scored["verdict"] = verdicts
+scored["reasons"] = reasons_col
+
+# Sort primarily by verdict class then by numeric score + volume
+verdict_rank = scored["verdict"].map({"✅ BUYABLE":2, "⚠️ WATCH":1, "❌ AVOID":0}).fillna(0)
+ranked = scored.assign(_v=verdict_rank).sort_values(
+    ["_v","score","volume24h_usd"], ascending=[False, False, False]
+).drop(columns=["_v"]).reset_index(drop=True)
 
 # ---------- Diagnostics ----------
 with st.expander("🧪 Data Status / Diagnostics", expanded=False):
     st.write({
-        "mode": mode,
-        "data_source": meta.get("source"),
+        "mode": mode, "data_source": meta.get("source"),
         "live_rows": meta.get("rows_live", None),
         "after_filter_rows": int(ranked.shape[0]),
         "relaxed_filters_used": relaxed_used,
@@ -318,18 +373,22 @@ with st.expander("🧪 Data Status / Diagnostics", expanded=False):
         st.dataframe(data.head(50), use_container_width=True)
 
 # ---------- Table ----------
-st.markdown("### Ranked Results")
+st.markdown("### Ranked Results with Verdicts")
 if ranked.empty:
     st.error("No rows to display. Lower thresholds, set Max Age to 0, or show all demo rows.")
 else:
-    st.dataframe(
-        ranked[[
-            "score","name","symbol","chain","price",
-            "liquidity_usd","volume24h_usd","txns24h","mcap_usd","age_days",
-            "dex_id","pair_url","base_address"
-        ]],
-        use_container_width=True
-    )
+    # Pretty verdict badges
+    def badge(v):
+        if "BUYABLE" in v: return f'<span class="badge badge-green">{v}</span>'
+        if "WATCH"   in v: return f'<span class="badge badge-yellow">{v}</span>'
+        return f'<span class="badge badge-red">{v}</span>'
+    show = ranked.copy()
+    show["verdict"] = show["verdict"].apply(badge)
+    # Render HTML for verdict and link button (pair_url)
+    show["pair"] = show["pair_url"].apply(lambda u: f'<a href="{u}" target="_blank">Open</a>' if isinstance(u,str) and u else "")
+    cols = ["verdict","signal_score_10","score","name","symbol","chain","price",
+            "liquidity_usd","volume24h_usd","txns24h","mcap_usd","reasons","dex_id","pair","base_address"]
+    st.write(show[cols].to_html(escape=False, index=False), unsafe_allow_html=True)
 
 # ---------- Visuals ----------
 st.markdown("### 📊 Visual Overview")
@@ -343,24 +402,29 @@ with tab1:
         cols = st.columns(3)
         for i, (_, r) in enumerate(top3.iterrows()):
             with cols[i]:
+                v = r["verdict"]
+                color = "green" if "BUYABLE" in v else ("orange" if "WATCH" in v else "red")
                 st.subheader(f"{r['name']} ({r['symbol']})")
+                st.markdown(f'<span class="badge badge-{"green" if color=="green" else ("yellow" if color=="orange" else "red")}">{v}</span>', unsafe_allow_html=True)
                 st.metric("Score", f"{r['score']:.3f}")
+                st.metric("Signal Score (0–10)", f"{int(r['signal_score_10'])}")
                 st.metric("Liquidity", f"${float(r['liquidity_usd']):,.0f}")
                 st.metric("24h Volume", f"${float(r['volume24h_usd']):,.0f}")
 
         c1, c2 = st.columns(2)
         with c1:
-            top_vol = ranked.nlargest(10, "volume24h_usd")[["name","volume24h_usd","score"]]
+            top_vol = ranked.nlargest(10, "volume24h_usd")[["name","volume24h_usd","signal_score_10","verdict"]]
             fig_bar = px.bar(top_vol, x="name", y="volume24h_usd",
-                             hover_data=["score"], title="Top 10 by 24h Volume")
+                             hover_data=["signal_score_10","verdict"], title="Top 10 by 24h Volume")
             fig_bar.update_layout(xaxis_title="", yaxis_title="24h Volume (USD)")
             st.plotly_chart(fig_bar, use_container_width=True)
+
         with c2:
             fig_scatter = px.scatter(
-                ranked.head(100),
+                ranked.head(120),
                 x="liquidity_usd", y="volume24h_usd",
-                size="mcap_usd", color="score",
-                hover_name="name", title="Liquidity vs Volume"
+                size="mcap_usd", color="signal_score_10",
+                hover_name="name", title="Liquidity vs Volume (colored by Signal Score)"
             )
             fig_scatter.update_layout(xaxis_title="Liquidity (USD)", yaxis_title="24h Volume (USD)")
             st.plotly_chart(fig_scatter, use_container_width=True)
@@ -375,7 +439,8 @@ with tab2:
 
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Score", float(row.get("score", 0)))
+            st.metric("Verdict", row.get("verdict"))
+            st.metric("Signal Score (0–10)", int(row.get("signal_score_10", 0)))
             st.metric("Price", f"${float(row.get('price', 0) or 0):.10f}")
         with col2:
             st.metric("Liquidity", f"${float(row.get('liquidity_usd', 0) or 0):,.0f}")
@@ -385,9 +450,8 @@ with tab2:
             st.metric("Txns24h", int(float(row.get('txns24h', 0) or 0)))
 
         def _norm(col, invert=False):
-            s_norm = minmax(ranked[col], invert)  # 0..1 series
-            try:
-                return float(s_norm.loc[idx])
+            s_norm = minmax(ranked[col], invert)
+            try: return float(s_norm.loc[idx])
             except Exception:
                 v = pd.to_numeric(ranked.loc[idx, col], errors="coerce")
                 return float(0.5 if pd.isna(v) else v)
@@ -402,13 +466,13 @@ with tab2:
         }
         theta = list(radar_vals.keys())
         rvals = list(radar_vals.values()) + [list(radar_vals.values())[0]]
-        fig = go.Figure(data=[go.Scatterpolar(r=rvals, theta=theta + [theta[0]],
-                                              fill='toself', name=row.get("name","-"))])
-        fig.update_layout(title="Attribute Radar",
-                          polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
+        fig = go.Figure(data=[go.Scatterpolar(r=rvals, theta=theta + [theta[0]], fill='toself', name=row.get("name","-"))])
+        fig.update_layout(title="Attribute Radar", polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Quick links
+        # Reasons + quick link
+        st.markdown("**Why this verdict:**")
+        st.markdown(f"<div class='small'>{row.get('reasons','')}</div>", unsafe_allow_html=True)
         if isinstance(row.get("pair_url"), str) and row.get("pair_url"):
             st.link_button("Open on DEX", row.get("pair_url"))
 
@@ -418,6 +482,6 @@ with tab3:
         st.download_button(
             "Export current table (CSV)",
             ranked.to_csv(index=False).encode("utf-8"),
-            file_name="memecoin_ranked_export.csv",
+            file_name="memecoin_ranked_verdicts.csv",
             mime="text/csv"
         )
