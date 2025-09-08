@@ -180,4 +180,225 @@ def load_live(chains_selected):
             all_rows += rows_from_pairs(pairs2, chains_selected)
 
     df = pd.DataFrame(all_rows)
-    meta["rows]()
+    meta["rows_live"] = len(df)
+
+    # 3) Optional: estimate Solana age via Birdeye symbols
+    if not df.empty and "Solana" in df["chain"].unique():
+        key = os.getenv("BIRDEYE_API_KEY", "").strip() or st.secrets.get("BIRDEYE_API_KEY", "")
+        if key:
+            headers = {"X-API-KEY": key}
+            bj, e3 = safe_get(
+                "https://public-api.birdeye.so/defi/tokenlist?sort_by=created&sort_type=desc&offset=0&limit=200",
+                headers=headers
+            )
+            if e3: meta["errors"].append(f"birdeye: {e3}")
+            tokens = (bj.get("data") or {}).get("tokens", []) if isinstance(bj, dict) else []
+            bd = pd.DataFrame(tokens)
+            if not bd.empty and {"symbol","createdTime"}.issubset(bd.columns):
+                now = time.time()
+                bd["age_days"] = (now - bd["createdTime"].astype(float)) / 86400.0
+                sym_age = bd.groupby("symbol", as_index=False)["age_days"].min()
+                mask_sol = df["chain"] == "Solana"
+                df.loc[mask_sol, "age_days"] = df.loc[mask_sol].merge(sym_age, on="symbol", how="left")["age_days"].values
+
+    df["age_days"] = df["age_days"].fillna(9999)
+    return df, meta
+
+# -------------------- Load data based on mode --------------------
+meta = {"source": "demo", "errors": [], "rows_live": 0}
+if mode == "Demo (offline)":
+    try:
+        data = load_demo()
+    except Exception as e:
+        st.error(f"Could not read sample_data.csv: {e}")
+        data = pd.DataFrame()
+else:
+    st.info("Fetching live data… (DexScreener; Birdeye optional for Solana age).")
+    try:
+        data, meta = load_live(chains)
+    except Exception as e:
+        meta["errors"].append(f"live_exception: {e}")
+        data = pd.DataFrame()
+
+# If live empty, fall back to demo gracefully
+if data.empty:
+    demo_ok = False
+    try:
+        data = load_demo()
+        demo_ok = not data.empty
+    except Exception as e:
+        meta["errors"].append(f"demo_read: {e}")
+        data = pd.DataFrame()
+
+    if demo_ok:
+        st.warning("Live fetch returned no rows. Showing Demo data so the app stays usable.")
+        meta["source"] = "demo_fallback"
+    else:
+        st.error("No data available (live and demo both failed).")
+        st.write("Diagnostics:", meta)
+        st.stop()
+
+# Ensure required columns exist; if not, adaptively add missing so visuals still render
+required_cols = [
+    "name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
+    "mcap_usd","age_days","is_honeypot","owner_renounced","liquidity_locked_pct",
+    "top10_holders_pct","telegram_members","twitter_followers","sentiment_score"
+]
+for c in required_cols:
+    if c not in data.columns:
+        data[c] = np.nan
+
+# -------------------- Filtering --------------------
+def apply_filters(df_in):
+    df1 = df_in[df_in["chain"].isin(chains)]
+    df1 = df1[df1["liquidity_usd"] >= min_liq]
+    df1 = df1[df1["volume24h_usd"] >= min_vol]
+    df1 = df1[df1["age_days"] <= max_age]
+    if require_locked and "liquidity_locked_pct" in df1.columns:
+        df1 = df1[df1["liquidity_locked_pct"].fillna(0) >= 70]
+    hide_honeypots = st.checkbox("Hide suspected honeypots", value=True)
+    if "is_honeypot" in df1.columns and hide_honeypots:
+        df1 = df1[~df1["is_honeypot"].fillna(False)]
+    return df1
+
+filtered = apply_filters(data)
+
+# If filters kill everything, auto-relax once
+relaxed_used = False
+if filtered.empty:
+    relaxed_used = True
+    st.warning("No projects match your filters. Relaxing thresholds so you can see results.")
+    relaxed = data.copy()
+    relaxed = relaxed[relaxed["chain"].isin(chains)]
+    relaxed = relaxed[relaxed["liquidity_usd"] >= max(0, min_liq * 0.25)]
+    relaxed = relaxed[relaxed["volume24h_usd"] >= max(0, min_vol * 0.25)]
+    relaxed = relaxed[relaxed["age_days"] <= (max_age if max_age > 0 else relaxed["age_days"].max())]
+    filtered = relaxed
+
+# -------------------- Scoring --------------------
+scored = filtered.copy()
+scored["score"] = (
+    (weights["w_liq"]  * minmax(scored["liquidity_usd"])) +
+    (weights["w_vol"]  * minmax(scored["volume24h_usd"])) +
+    (weights["w_tx"]   * minmax(scored["txns24h"])) +
+    (weights["w_age"]  * (1 - minmax(scored["age_days"]))) +
+    (weights["w_lock"] * minmax(scored["liquidity_locked_pct"])) +
+    (weights["w_top10"]* (1 - minmax(scored["top10_holders_pct"]))) +
+    (weights["w_sent"] * minmax(scored["sentiment_score"])) +
+    (weights["w_security"] * (1 - minmax(scored["is_honeypot"].fillna(False).astype(int))))
+).round(3)
+
+ranked = scored.sort_values("score", ascending=False).reset_index(drop=True)
+
+# -------------------- Data status (debug) --------------------
+with st.expander("🧪 Data Status / Diagnostics", expanded=False):
+    st.write({
+        "mode": mode,
+        "data_source": meta.get("source"),
+        "live_rows": meta.get("rows_live", None),
+        "after_filter_rows": int(ranked.shape[0]),
+        "relaxed_filters_used": relaxed_used,
+        "errors": meta.get("errors", []),
+    })
+    if st.checkbox("Show raw rows (head)"):
+        st.dataframe(data.head(50), use_container_width=True)
+
+# -------------------- Table --------------------
+st.markdown("### Ranked Results")
+if ranked.empty:
+    st.error("No rows to display even after relaxing. Try lowering min liquidity/volume, or unchecking lock requirement.")
+else:
+    st.dataframe(
+        ranked[[
+            "score","name","symbol","chain","price","liquidity_usd","volume24h_usd","txns24h",
+            "mcap_usd","age_days","liquidity_locked_pct","top10_holders_pct","sentiment_score"
+        ]],
+        use_container_width=True
+    )
+
+# -------------------- Visual Overview --------------------
+st.markdown("### 📊 Visual Overview")
+tab1, tab2, tab3 = st.tabs(["Overview", "Details", "Notes"])
+
+with tab1:
+    if ranked.empty:
+        st.info("No data for charts.")
+    else:
+        top3 = ranked.head(3)
+        cols = st.columns(3)
+        for i, (_, r) in enumerate(top3.iterrows()):
+            with cols[i]:
+                st.subheader(f"{r['name']} ({r['symbol']})")
+                st.metric("Score", f"{r['score']:.3f}")
+                st.metric("Liquidity", f"${to_float(r['liquidity_usd']):,.0f}")
+                st.metric("24h Volume", f"${to_float(r['volume24h_usd']):,.0f}")
+                st.metric("Top-10 Holders %", f"{to_float(r.get('top10_holders_pct')):.1f}%")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            top_vol = ranked.nlargest(10, "volume24h_usd")[["name","volume24h_usd","score"]]
+            fig_bar = px.bar(top_vol, x="name", y="volume24h_usd",
+                             hover_data=["score"], title="Top 10 by 24h Volume")
+            fig_bar.update_layout(xaxis_title="", yaxis_title="24h Volume (USD)")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with c2:
+            fig_scatter = px.scatter(
+                ranked.head(100),
+                x="liquidity_usd", y="volume24h_usd",
+                size="mcap_usd", color="score",
+                hover_name="name", title="Liquidity vs Volume"
+            )
+            fig_scatter.update_layout(xaxis_title="Liquidity (USD)", yaxis_title="24h Volume (USD)")
+            st.plotly_chart(fig_scatter, use_container_width=True)
+
+with tab2:
+    if ranked.empty:
+        st.info("No selection available.")
+    else:
+        options = ranked["name"].tolist()
+        sel = st.selectbox("Pick a project", options)
+        if sel not in options: sel = options[0]
+        row = ranked.loc[ranked["name"] == sel]
+        if row.empty: row = ranked.iloc[[0]]
+        row = row.iloc[0]
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Score", row["score"])
+            st.metric("Price", f"${float(row['price'] or 0):.10f}")
+        with col2:
+            st.metric("Liquidity", f"${to_float(row['liquidity_usd']):,.0f}")
+            st.metric("Mcap", f"${to_float(row['mcap_usd']):,.0f}")
+        with col3:
+            st.metric("Age", int(row['age_days'] or 0))
+            st.metric("Txns24h", int(row['txns24h'] or 0))
+
+        def _norm(col, invert=False):
+            return float(minmax(ranked[col], invert).loc[ranked["name"] == sel])
+
+        radar_vals = {
+            "Liquidity": _norm("liquidity_usd"),
+            "Volume": _norm("volume24h_usd"),
+            "Txns": _norm("txns24h"),
+            "Lock%": _norm("liquidity_locked_pct"),
+            "Top10(↓)": _norm("top10_holders_pct", invert=True),
+            "Sentiment": _norm("sentiment_score"),
+        }
+        theta = list(radar_vals.keys())
+        rvals = list(radar_vals.values()) + [list(radar_vals.values())[0]]
+        fig = go.Figure(data=[go.Scatterpolar(r=rvals, theta=theta + [theta[0]],
+                                              fill='toself', name=sel)])
+        fig.update_layout(title="Attribute Radar",
+                          polar=dict(radialaxis=dict(visible=True, range=[0, 1])))
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab3:
+    st.markdown("Use this tab as your trading journal — jot down entry/exit reasoning, catalysts, risks, etc.")
+    if not ranked.empty:
+        st.download_button(
+            "Export current table (CSV)",
+            data=ranked.to_csv(index=False).encode("utf-8"),
+            file_name="memecoin_ranked_export.csv",
+            mime="text/csv"
+        )
